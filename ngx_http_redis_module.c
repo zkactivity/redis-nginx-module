@@ -7,11 +7,25 @@ typedef struct
 {
     ngx_http_status_t           status;
     ngx_str_t					backendServer;
+
+    ngx_int_t                  query_count;
+    ngx_http_request_t        *request;
+    int                        state;
+    size_t                     chunk_size;
+    size_t                     chunk_bytes_read;
+    size_t                     chunks_read;
+    size_t                     chunk_count;
 } ngx_http_redis_ctx_t;
 
 typedef struct
 {
-    ngx_http_upstream_conf_t upstream;
+    ngx_http_upstream_conf_t   upstream;
+    ngx_str_t                  literal_query; /* for redis_literal_raw_query */
+    ngx_http_complex_value_t  *complex_query; /* for redis_raw_query */
+    ngx_http_complex_value_t  *complex_query_count; /* for redis_raw_query */
+    ngx_http_complex_value_t  *complex_target; /* for redis_pass */
+    ngx_array_t               *queries; /* for redis_query */
+
 } ngx_http_redis_conf_t;
 
 
@@ -22,26 +36,22 @@ static ngx_int_t ngx_http_redis_handler(ngx_http_request_t *r);
 static void* ngx_http_redis_create_loc_conf(ngx_conf_t *cf);
 static char *ngx_http_redis_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child);
 
+static char *
+ngx_http_redis_query(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+
 static ngx_int_t
 redis_process_status_line(ngx_http_request_t *r);
 
 
-static ngx_str_t  ngx_http_proxy_hide_headers[] =
-{
-    ngx_string("Date"),
-    ngx_string("Server"),
-    ngx_string("X-Pad"),
-    ngx_string("X-Accel-Expires"),
-    ngx_string("X-Accel-Redirect"),
-    ngx_string("X-Accel-Limit-Rate"),
-    ngx_string("X-Accel-Buffering"),
-    ngx_string("X-Accel-Charset"),
-    ngx_null_string
-};
-
-
 static ngx_command_t  ngx_http_redis_commands[] =
 {
+
+    { ngx_string("redis_query"),
+      NGX_HTTP_LOC_CONF|NGX_HTTP_LIF_CONF|NGX_CONF_1MORE,
+      ngx_http_redis_query,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
 
     {
         ngx_string("redis"),
@@ -87,107 +97,422 @@ ngx_module_t  ngx_http_redis_module =
 };
 
 
+
+static char *
+ngx_http_redis_query(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_redis_conf_t  *rlcf = conf;
+    ngx_str_t                   *value;
+    ngx_array_t                **query;
+    ngx_uint_t                   n;
+    ngx_http_complex_value_t   **arg;
+    ngx_uint_t                   i;
+
+    ngx_http_compile_complex_value_t         ccv;
+
+    if (rlcf->literal_query.len) {
+        return "conflicts with redis_literal_raw_query";
+    }
+
+    if (rlcf->complex_query) {
+        return "conflicts with redis_raw_query";
+    }
+
+    if (rlcf->queries == NULL) {
+        rlcf->queries = ngx_array_create(cf->pool, 1, sizeof(ngx_array_t *));
+
+        if (rlcf->queries == NULL) {
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    query = ngx_array_push(rlcf->queries);
+    if (query == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    n = cf->args->nelts - 1;
+
+    *query = ngx_array_create(cf->pool, n, sizeof(ngx_http_complex_value_t *));
+
+    if (*query == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    value = cf->args->elts;
+
+    for (i = 1; i <= n; i++) {
+        arg = ngx_array_push(*query);
+        if (arg == NULL) {
+            return NGX_CONF_ERROR;
+        }
+
+        *arg = ngx_palloc(cf->pool, sizeof(ngx_http_complex_value_t));
+        if (*arg == NULL) {
+            return NGX_CONF_ERROR;
+        }
+
+        if (value[i].len == 0) {
+            ngx_memzero(*arg, sizeof(ngx_http_complex_value_t));
+            continue;
+        }
+
+        ngx_memzero(&ccv, sizeof(ngx_http_compile_complex_value_t));
+        ccv.cf = cf;
+        ccv.value = &value[i];
+        ccv.complex_value = *arg;
+
+        if (ngx_http_compile_complex_value(&ccv) != NGX_OK) {
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    return NGX_CONF_OK;
+}
+
 static void* ngx_http_redis_create_loc_conf(ngx_conf_t *cf)
 {
-    ngx_http_redis_conf_t  *mycf;
+    ngx_http_redis_conf_t  *conf;
 
-    mycf = (ngx_http_redis_conf_t  *)ngx_pcalloc(cf->pool, sizeof(ngx_http_redis_conf_t));
-    if (mycf == NULL)
-    {
+    conf = ngx_pcalloc(cf->pool, sizeof(ngx_http_redis_conf_t));
+    if (conf == NULL) {
         return NULL;
     }
 
-    //以下简单的硬编码ngx_http_upstream_conf_t结构中的各成员，例如
-//超时时间都设为1分钟。这也是http反向代理模块的默认值
-    mycf->upstream.connect_timeout = 60000;
-    mycf->upstream.send_timeout = 60000;
-    mycf->upstream.read_timeout = 60000;
-    mycf->upstream.store_access = 0600;
-    //实际上buffering已经决定了将以固定大小的内存作为缓冲区来转发上游的
-//响应包体，这块固定缓冲区的大小就是buffer_size。如果buffering为1
-//就会使用更多的内存缓存来不及发往下游的响应，例如最多使用bufs.num个
-//缓冲区、每个缓冲区大小为bufs.size，另外还会使用临时文件，临时文件的
-//最大长度为max_temp_file_size
-    mycf->upstream.buffering = 0;
-    mycf->upstream.bufs.num = 8;
-    mycf->upstream.bufs.size = ngx_pagesize;
-    mycf->upstream.buffer_size = ngx_pagesize;
-    mycf->upstream.busy_buffers_size = 2 * ngx_pagesize;
-    mycf->upstream.temp_file_write_size = 2 * ngx_pagesize;
-    mycf->upstream.max_temp_file_size = 1024 * 1024 * 1024;
+    /*
+     * set by ngx_pcalloc():
+     *
+     *     conf->upstream.bufs.num = 0;
+     *     conf->upstream.next_upstream = 0;
+     *     conf->upstream.temp_path = NULL;
+     *     conf->upstream.uri = { 0, NULL };
+     *     conf->upstream.location = NULL;
+     *     conf->complex_query = NULL;
+     *     conf->literal_query = { 0, NULL };
+     *     conf->queries = NULL;
+     */
 
-    //upstream模块要求hide_headers成员必须要初始化（upstream在解析
-//完上游服务器返回的包头时，会调用
-//ngx_http_upstream_process_headers方法按照hide_headers成员将
-//本应转发给下游的一些http头部隐藏），这里将它赋为
-//NGX_CONF_UNSET_PTR ，是为了在merge合并配置项方法中使用
-//upstream模块提供的ngx_http_upstream_hide_headers_hash
-//方法初始化hide_headers 成员
-    mycf->upstream.hide_headers = NGX_CONF_UNSET_PTR;
-    mycf->upstream.pass_headers = NGX_CONF_UNSET_PTR;
+    conf->upstream.connect_timeout = NGX_CONF_UNSET_MSEC;
+    conf->upstream.send_timeout = NGX_CONF_UNSET_MSEC;
+    conf->upstream.read_timeout = NGX_CONF_UNSET_MSEC;
 
-    return mycf;
+    conf->upstream.buffer_size = NGX_CONF_UNSET_SIZE;
+
+    /* the hardcoded values */
+    conf->upstream.cyclic_temp_file = 0;
+    conf->upstream.buffering = 0;
+    conf->upstream.ignore_client_abort = 1;
+    conf->upstream.send_lowat = 0;
+    conf->upstream.bufs.num = 0;
+    conf->upstream.busy_buffers_size = 0;
+    conf->upstream.max_temp_file_size = 0;
+    conf->upstream.temp_file_write_size = 0;
+    conf->upstream.intercept_errors = 1;
+    conf->upstream.intercept_404 = 1;
+    conf->upstream.pass_request_headers = 0;
+    conf->upstream.pass_request_body = 0;
+
+    return conf;
 }
+
 
 
 static char *ngx_http_redis_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 {
-    ngx_http_redis_conf_t *prev = (ngx_http_redis_conf_t *)parent;
-    ngx_http_redis_conf_t *conf = (ngx_http_redis_conf_t *)child;
+    ngx_http_redis_conf_t *prev = parent;
+    ngx_http_redis_conf_t *conf = child;
 
-    ngx_hash_init_t             hash;
-    hash.max_size = 100;
-    hash.bucket_size = 1024;
-    hash.name = "proxy_headers_hash";
-    if (ngx_http_upstream_hide_headers_hash(cf, &conf->upstream,
-                                            &prev->upstream, ngx_http_proxy_hide_headers, &hash)
-        != NGX_OK)
-    {
-        return NGX_CONF_ERROR;
+    ngx_conf_merge_msec_value(conf->upstream.connect_timeout,
+                              prev->upstream.connect_timeout, 60000);
+
+    ngx_conf_merge_msec_value(conf->upstream.send_timeout,
+                              prev->upstream.send_timeout, 60000);
+
+    ngx_conf_merge_msec_value(conf->upstream.read_timeout,
+                              prev->upstream.read_timeout, 60000);
+
+    ngx_conf_merge_size_value(conf->upstream.buffer_size,
+                              prev->upstream.buffer_size,
+                              (size_t) ngx_pagesize);
+
+    ngx_conf_merge_bitmask_value(conf->upstream.next_upstream,
+                                 prev->upstream.next_upstream,
+                                 (NGX_CONF_BITMASK_SET
+                                  |NGX_HTTP_UPSTREAM_FT_ERROR
+                                  |NGX_HTTP_UPSTREAM_FT_TIMEOUT));
+
+    if (conf->upstream.next_upstream & NGX_HTTP_UPSTREAM_FT_OFF) {
+        conf->upstream.next_upstream = NGX_CONF_BITMASK_SET
+                                       |NGX_HTTP_UPSTREAM_FT_OFF;
+    }
+
+    if (conf->upstream.upstream == NULL) {
+        conf->upstream.upstream = prev->upstream.upstream;
+    }
+
+    if (conf->complex_query == NULL) {
+        conf->complex_query = prev->complex_query;
+    }
+
+    if (conf->complex_query_count == NULL) {
+        conf->complex_query_count = prev->complex_query_count;
+    }
+
+    if (conf->queries == NULL) {
+        conf->queries = prev->queries;
+    }
+
+    if (conf->literal_query.data == NULL) {
+        conf->literal_query.data = prev->literal_query.data;
+        conf->literal_query.len = prev->literal_query.len;
     }
 
     return NGX_CONF_OK;
 }
 
 
+static size_t
+ngx_get_num_size(uint64_t i)
+{
+    size_t          n = 0;
+
+    do {
+        i = i / 10;
+        n++;
+    } while (i > 0);
+
+    return n;
+}
+
+
+ngx_int_t
+ngx_http_redis_build_query(ngx_http_request_t *r, ngx_array_t *queries,
+    ngx_buf_t **b)
+{
+    ngx_uint_t                       i, j;
+    ngx_uint_t                       n;
+    ngx_str_t                       *arg;
+    ngx_array_t                     *args;
+    size_t                           len;
+    ngx_array_t                    **query_args;
+    ngx_http_complex_value_t       **complex_arg;
+    u_char                          *p;
+    ngx_http_redis_conf_t      *rlcf;
+
+    rlcf = ngx_http_get_module_loc_conf(r, ngx_http_redis_module);
+
+    query_args = rlcf->queries->elts;
+
+    n = 0;
+    for (i = 0; i < rlcf->queries->nelts; i++) {
+        for (j = 0; j < query_args[i]->nelts; j++) {
+            n++;
+        }
+    }
+
+    args = ngx_array_create(r->pool, n, sizeof(ngx_str_t));
+
+    if (args == NULL) {
+        return NGX_ERROR;
+    }
+
+    len = 0;
+    n = 0;
+
+    for (i = 0; i < rlcf->queries->nelts; i++) {
+        complex_arg = query_args[i]->elts;
+
+        len += sizeof("*") - 1
+             + ngx_get_num_size(query_args[i]->nelts)
+             + sizeof("\r\n") - 1
+             ;
+
+        for (j = 0; j < query_args[i]->nelts; j++) {
+            n++;
+
+            arg = ngx_array_push(args);
+            if (arg == NULL) {
+                return NGX_ERROR;
+            }
+
+            if (ngx_http_complex_value(r, complex_arg[j], arg) != NGX_OK) {
+                return NGX_ERROR;
+            }
+
+            len += sizeof("$") - 1
+                 + ngx_get_num_size(arg->len)
+                 + sizeof("\r\n") - 1
+                 + arg->len
+                 + sizeof("\r\n") - 1
+                 ;
+			
+#if 1
+			{
+				char tempstr[1024] = {0};
+				snprintf(tempstr, arg->len + strlen("the fucking query data: ") + 1,"the fucking query data: %s", arg->data);
+				//debug script
+				printf("\033[1;31m[File:%s]\033[0m\n", __FILE__);
+				printf("\033[1;31m[Function:%s]\033[0m\n", __FUNCTION__);
+				printf("\033[1;31m[Line:%d]\033[0m\n", __LINE__);
+				printf("\033[1;31m[tempstr:%s]\033[0m\n", tempstr);
+				printf("\n");
+			}
+#endif
+        }
+    }
+
+    *b = ngx_create_temp_buf(r->pool, len);
+    if (*b == NULL) {
+        return NGX_ERROR;
+    }
+
+    p = (*b)->last;
+
+    arg = args->elts;
+
+    n = 0;
+    for (i = 0; i < rlcf->queries->nelts; i++) {
+        *p++ = '*';
+        p = ngx_sprintf(p, "%uz", query_args[i]->nelts);
+        *p++ = '\r'; *p++ = '\n';
+
+        for (j = 0; j < query_args[i]->nelts; j++) {
+            *p++ = '$';
+            p = ngx_sprintf(p, "%uz", arg[n].len);
+            *p++ = '\r'; *p++ = '\n';
+            p = ngx_copy(p, arg[n].data, arg[n].len);
+            *p++ = '\r'; *p++ = '\n';
+
+            n++;
+        }
+    }
+
+//    dd("query: %.*s", (int) (p - (*b)->pos), (*b)->pos);
+
+    if (p - (*b)->pos != (ssize_t) len) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "redis: redis_query buffer error %uz != %uz",
+                      (size_t) (p - (*b)->pos), len);
+
+        return NGX_ERROR;
+    }
+
+    (*b)->last = p;
+
+    return NGX_OK;
+}
+
 static ngx_int_t
 redis_upstream_create_request(ngx_http_request_t *r)
 {
-    //发往google上游服务器的请求很简单，就是模仿正常的搜索请求，
-//以/search?q=…的URL来发起搜索请求。backendQueryLine中的%V等转化
-//格式的用法，请参见4.4节中的表4-7
-    static ngx_str_t backendQueryLine =
-        ngx_string("*2\r\n$3\r\nget\r\n$4\r\nfuck\r\n*1\r\n$4\r\nquit\r\n");
-    //必须由内存池中申请内存，这有两点好处：在网络情况不佳的情况下，向上游
-//服务器发送请求时，可能需要epoll多次调度send发送才能完成，
-//这时必须保证这段内存不会被释放；请求结束时，这段内存会被自动释放，
-//降低内存泄漏的可能
-    ngx_buf_t* b = ngx_create_temp_buf(r->pool, backendQueryLine.len);
-    if (b == NULL)
+    ngx_buf_t                       *b;
+    ngx_chain_t                     *cl;
+    ngx_http_redis_conf_t      *rlcf;
+    ngx_str_t                        query;
+    ngx_str_t                        query_count;
+    ngx_int_t                        rc;
+    ngx_http_redis_ctx_t           *ctx;
+    ngx_int_t                        n;
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_redis_module);
+
+    rlcf = ngx_http_get_module_loc_conf(r, ngx_http_redis_module);
+
+    if (rlcf->queries) {
+        ctx->query_count = rlcf->queries->nelts;
+
+        rc = ngx_http_redis_build_query(r, rlcf->queries, &b);
+        if (rc != NGX_OK) {
+            return rc;
+        }
+
+    } else if (rlcf->literal_query.len == 0) {
+        if (rlcf->complex_query == NULL) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                          "no redis query specified or the query is empty");
+
+            return NGX_ERROR;
+        }
+
+        if (ngx_http_complex_value(r, rlcf->complex_query, &query)
+            != NGX_OK)
+        {
+            return NGX_ERROR;
+        }
+
+        if (query.len == 0) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                          "the redis query is empty");
+
+            return NGX_ERROR;
+        }
+
+        if (rlcf->complex_query_count == NULL) {
+            ctx->query_count = 1;
+
+        } else {
+            if (ngx_http_complex_value(r, rlcf->complex_query_count,
+                                       &query_count)
+                != NGX_OK)
+            {
+                return NGX_ERROR;
+            }
+
+            if (query_count.len == 0) {
+                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                              "the N argument to redis_raw_queries is empty");
+
+                return NGX_ERROR;
+            }
+
+            n = ngx_atoi(query_count.data, query_count.len);
+            if (n == NGX_ERROR || n == 0) {
+                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                              "the N argument to redis_raw_queries is "
+                              "invalid");
+
+                return NGX_ERROR;
+            }
+
+            ctx->query_count = n;
+        }
+
+        b = ngx_create_temp_buf(r->pool, query.len);
+        if (b == NULL) {
+            return NGX_ERROR;
+        }
+
+        b->last = ngx_copy(b->pos, query.data, query.len);
+
+    } else {
+        ctx->query_count = 1;
+
+        b = ngx_calloc_buf(r->pool);
+        if (b == NULL) {
+            return NGX_ERROR;
+        }
+
+        b->pos = rlcf->literal_query.data;
+        b->last = b->pos + rlcf->literal_query.len;
+        b->memory = 1;
+    }
+
+    cl = ngx_alloc_chain_link(r->pool);
+    if (cl == NULL) {
         return NGX_ERROR;
-    //last要指向请求的末尾
-    b->last = b->pos + backendQueryLine.len;
+    }
 
-    //作用相当于snprintf，只是它支持4.4节中的表4-7列出的所有转换格式
-    ngx_snprintf(b->pos, backendQueryLine.len ,
-                 (char*)backendQueryLine.data);
-    // r->upstream->request_bufs是一个ngx_chain_t结构，它包含着要
-//发送给上游服务器的请求
-    r->upstream->request_bufs = ngx_alloc_chain_link(r->pool);
-    if (r->upstream->request_bufs == NULL)
-        return NGX_ERROR;
+    cl->buf = b;
+    cl->next = NULL;
 
-    // request_bufs这里只包含1个ngx_buf_t缓冲区
-    r->upstream->request_bufs->buf = b;
-    r->upstream->request_bufs->next = NULL;
+    r->upstream->request_bufs = cl;
 
-    r->upstream->request_sent = 0;
-    r->upstream->header_sent = 0;
-    // header_hash不可以为0
-    r->header_hash = 1;
-    r->subrequest_in_memory = 0;
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "http redis request: \"%V\"", &rlcf->literal_query);
+
     return NGX_OK;
 }
+
 
 static ngx_int_t
 redis_process_status_line(ngx_http_request_t *r)
@@ -219,7 +544,7 @@ redis_process_status_line(ngx_http_request_t *r)
         case ':':
         case '$':
         case '*':
-            //ctx->filter = ngx_http_redis2_process_reply;
+            //ctx->filter = ngx_http_redis_process_reply;
             break;
 
         default:
@@ -227,7 +552,7 @@ redis_process_status_line(ngx_http_request_t *r)
             buf.len = b->last - b->pos;
 
             ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                          "redis2 sent invalid response: \"%V\"", &buf);
+                          "redis sent invalid response: \"%V\"", &buf);
 
             return NGX_HTTP_UPSTREAM_INVALID_HEADER;
     }
